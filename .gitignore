@@ -107,3 +107,17 @@ InitTestScene*.unity*
 
 # Auto-generated cache in Assets folder
 /[Aa]ssets/[Ss]ceneDependencyCache*
+
+# Entorno Python y resultados de entrenamiento
+env/
+.venv/
+venv/
+__pycache__/
+*.pyc
+results/
+
+# Capturas del profiler 
+/[Pp]rofilerCaptures/
+
+# Configuración personal de VS Code
+.vscode/

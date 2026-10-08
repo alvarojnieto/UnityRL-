@@ -17,108 +17,349 @@ public class CocheAgente : Agent
     [SerializeField] private string etiquetaMeta = "Meta";
 
     [Header("Recompensas")]
-    [SerializeField] private float recompensaAvance = 1f;   
-    [SerializeField] private float bonusMeta = 1f;
-    [SerializeField] private float castigoChoque = -1f;
+    [SerializeField] private float recompensaVelocidadPista = 0.002f;
+    [SerializeField] private float costeTiempo = 0.001f;
+    [SerializeField] private float bonusMeta = 5f;
+    [SerializeField] private float castigoChoque = -2f;
 
-    [SerializeField] private float velocidadMaxima = 20f;   
+    [Header("Configuración")]
+    [SerializeField] private float velocidadMaxima = 20f;
+    [SerializeField] private float distanciaNormalizacion = 10f;
+
+    [Header("Piloto automático (solo para pruebas, mantén ESPACIO en Heuristic)")]
+    [SerializeField] private float pilotoAcelerador = 1f;
+    [SerializeField] private float pilotoGanancia = 2f;
+
+    [Header("Debug")]
+    [SerializeField] private bool mostrarLogs = false;
+
     private Rigidbody rb;
     private CocheController motor;
-    private float ultimoAvance;
+
     private bool terminado;
+
+
+    // =========================================================
+    // INITIALIZE
+    // =========================================================
 
     public override void Initialize()
     {
         rb = GetComponent<Rigidbody>();
         motor = GetComponent<CocheController>();
+
         motor.ControlExterno = true;
     }
+
+
+    // =========================================================
+    // INICIO DEL EPISODIO
+    // =========================================================
 
     public override void OnEpisodeBegin()
     {
         terminado = false;
 
         var spline = lineaGuia.Spline;
-        Vector3 pos = lineaGuia.transform.TransformPoint((Vector3)SplineUtility.EvaluatePosition(spline, 0f));
-        Vector3 dir = lineaGuia.transform.TransformDirection((Vector3)SplineUtility.EvaluateTangent(spline, 0f));
+
+        // Posición inicial
+        Vector3 pos =
+            lineaGuia.transform.TransformPoint(
+                (Vector3)SplineUtility.EvaluatePosition(
+                    spline,
+                    0f
+                )
+            );
+
+        // Dirección inicial
+        Vector3 dir =
+            lineaGuia.transform.TransformDirection(
+                (Vector3)SplineUtility.EvaluateTangent(
+                    spline,
+                    0f
+                )
+            );
+
         dir.y = 0f;
 
-        transform.SetPositionAndRotation(pos + Vector3.up * alturaInicial,
-                                         Quaternion.LookRotation(dir.normalized));
+        // Colocar coche
+        transform.SetPositionAndRotation(
+            pos + Vector3.up * alturaInicial,
+            Quaternion.LookRotation(dir.normalized)
+        );
+
+        // Reset físico
         rb.linearVelocity = Vector3.zero;
         rb.angularVelocity = Vector3.zero;
+
+        // Reset controles
         motor.Acelerador = 0f;
         motor.Direccion = 0f;
-
-        ultimoAvance = CalcularAvance();
     }
+
+
+    // =========================================================
+    // OBSERVACIONES (6 en total: Space Size = 6)
+    // =========================================================
 
     public override void CollectObservations(VectorSensor sensor)
     {
-        Vector3 v = transform.InverseTransformDirection(rb.linearVelocity);
-        sensor.AddObservation(v.x / velocidadMaxima);          
-        sensor.AddObservation(v.z / velocidadMaxima);          
-        sensor.AddObservation(rb.angularVelocity.y / 5f);      
+        // 1. Velocidad local del coche (2 valores)
+        Vector3 velocidadLocal =
+            transform.InverseTransformDirection(
+                rb.linearVelocity
+            );
+
+        sensor.AddObservation(
+            Mathf.Clamp(velocidadLocal.x / velocidadMaxima, -1f, 1f)
+        );
+
+        sensor.AddObservation(
+            Mathf.Clamp(velocidadLocal.z / velocidadMaxima, -1f, 1f)
+        );
+
+        // 2. Velocidad angular (1 valor)
+        sensor.AddObservation(
+            Mathf.Clamp(rb.angularVelocity.y / 5f, -1f, 1f)
+        );
+
+        // 3. Información de la spline
+        ObtenerInformacionSpline(
+            out Vector3 tangenteMundo,
+            out float distanciaLateral
+        );
+
+        // 4. Dirección de la pista relativa al coche (2 valores)
+        Vector3 tangenteCoche =
+            transform.InverseTransformDirection(
+                tangenteMundo
+            );
+
+        sensor.AddObservation(tangenteCoche.x);
+        sensor.AddObservation(tangenteCoche.z);
+
+        // 5. Distancia lateral a la pista (1 valor)
+        sensor.AddObservation(
+            Mathf.Clamp(
+                distanciaLateral / distanciaNormalizacion,
+                -1f,
+                1f
+            )
+        );
     }
 
-    public override void OnActionReceived(ActionBuffers acciones)
+
+    // =========================================================
+    // ACCIONES
+    // =========================================================
+
+    public override void OnActionReceived(
+        ActionBuffers acciones
+    )
     {
-        if (terminado) return;
+        if (terminado)
+            return;
 
-        motor.Acelerador = Mathf.Clamp(acciones.ContinuousActions[0], -1f, 1f);
-        motor.Direccion = Mathf.Clamp(acciones.ContinuousActions[1], -1f, 1f);
+        float acelerador =
+            Mathf.Clamp01(acciones.ContinuousActions[0]);
 
-        // Recompensa por avanzar a lo largo de la línea guía
-        float avance = CalcularAvance();
-        float delta = avance - ultimoAvance;
-        ultimoAvance = avance;
-        if (Mathf.Abs(delta) < 0.2f)               
-            AddReward(delta * recompensaAvance);
+        float direccion =
+            Mathf.Clamp(acciones.ContinuousActions[1], -1f, 1f);
 
-      
-        if (MaxStep > 0) AddReward(-1f / MaxStep);
+        motor.Acelerador = acelerador;
+        motor.Direccion = direccion;
+
+        // Dirección de la pista
+        ObtenerInformacionSpline(
+            out Vector3 tangenteMundo,
+            out float distanciaLateral
+        );
+
+        // Velocidad en la dirección de la pista
+        float velocidadEnPista =
+            Vector3.Dot(
+                rb.linearVelocity,
+                tangenteMundo
+            );
+
+        // Recompensa por avanzar (y castigo simétrico si va hacia atrás)
+        AddReward(velocidadEnPista * recompensaVelocidadPista);
+
+        // Coste por tiempo
+        AddReward(-costeTiempo);
     }
 
-    public override void Heuristic(in ActionBuffers actionsOut)
+
+    // =========================================================
+    // HEURISTIC
+    // =========================================================
+
+    public override void Heuristic(
+        in ActionBuffers actionsOut
+    )
     {
-        var acc = actionsOut.ContinuousActions;
-        var teclado = Keyboard.current;
-        float a = 0f, d = 0f;
+        var acc =
+            actionsOut.ContinuousActions;
+
+        var teclado =
+            Keyboard.current;
+
+        float acelerador = 0f;
+        float direccion = 0f;
+
         if (teclado != null)
         {
-            if (teclado.wKey.isPressed) a += 1f;
-            if (teclado.sKey.isPressed) a -= 1f;
-            if (teclado.dKey.isPressed) d += 1f;
-            if (teclado.aKey.isPressed) d -= 1f;
+            if (teclado.wKey.isPressed)
+                acelerador += 1f;
+
+            if (teclado.sKey.isPressed)
+                acelerador -= 1f;
+
+            if (teclado.dKey.isPressed)
+                direccion += 1f;
+
+            if (teclado.aKey.isPressed)
+                direccion -= 1f;
         }
-        acc[0] = a;
-        acc[1] = d;
+
+        // Piloto automático de prueba: mantén ESPACIO pulsado.
+        // Gira hacia donde apunta la pista y hacia el centro de la línea guía.
+        if (teclado != null && teclado.spaceKey.isPressed)
+        {
+            ObtenerInformacionSpline(
+                out Vector3 tangenteMundo,
+                out float lateral
+            );
+
+            Vector3 tangenteCoche =
+                transform.InverseTransformDirection(tangenteMundo);
+
+            direccion = Mathf.Clamp(
+                (tangenteCoche.x + lateral / distanciaNormalizacion)
+                    * pilotoGanancia,
+                -1f,
+                1f
+            );
+
+            acelerador = pilotoAcelerador;
+        }
+
+        acc[0] = acelerador;
+        acc[1] = direccion;
     }
 
-    private float CalcularAvance()
+
+    // =========================================================
+    // INFORMACIÓN DE LA SPLINE
+    // =========================================================
+
+    private void ObtenerInformacionSpline(
+        out Vector3 tangenteMundo,
+        out float distanciaLateral
+    )
     {
-        Vector3 local = lineaGuia.transform.InverseTransformPoint(transform.position);
-        SplineUtility.GetNearestPoint(lineaGuia.Spline, new float3(local.x, local.y, local.z),
-                                      out float3 _, out float t, 16, 4);
-        return t;  
+        Vector3 localPos =
+            lineaGuia.transform.InverseTransformPoint(
+                transform.position
+            );
+
+        // Punto más cercano de la línea guía
+        SplineUtility.GetNearestPoint(
+            lineaGuia.Spline,
+            new float3(localPos.x, localPos.y, localPos.z),
+            out float3 punto,
+            out float t,
+            16,
+            4
+        );
+
+        // Tangente de la spline en ese punto
+        Vector3 tangenteLocal =
+            (Vector3)SplineUtility.EvaluateTangent(
+                lineaGuia.Spline,
+                t
+            );
+
+        tangenteMundo =
+            lineaGuia.transform.TransformDirection(
+                tangenteLocal
+            );
+
+        tangenteMundo.y = 0f;
+
+        if (tangenteMundo.sqrMagnitude > 0.001f)
+            tangenteMundo.Normalize();
+        else
+            tangenteMundo = transform.forward;
+
+        // Distancia lateral (positiva si la línea guía queda a la derecha del coche)
+        Vector3 puntoMundo =
+            lineaGuia.transform.TransformPoint(
+                (Vector3)punto
+            );
+
+        Vector3 diferencia =
+            puntoMundo - transform.position;
+
+        diferencia.y = 0f;
+
+        distanciaLateral =
+            Vector3.Dot(
+                diferencia,
+                transform.right
+            );
     }
 
-    void OnCollisionEnter(Collision c)
+
+    // =========================================================
+    // COLISIÓN CON MURO
+    // =========================================================
+
+    private void OnCollisionEnter(Collision c)
     {
-        if (c.collider.CompareTag(etiquetaMuro)) Terminar(castigoChoque, "Choque");
+        if (c.collider.CompareTag(etiquetaMuro))
+        {
+            Terminar(castigoChoque, "Choque");
+        }
     }
 
-    void OnTriggerEnter(Collider other)
+
+    // =========================================================
+    // META
+    // =========================================================
+
+    private void OnTriggerEnter(Collider other)
     {
-        if (other.CompareTag(etiquetaMeta)) Terminar(bonusMeta, "Meta");
+        if (other.CompareTag(etiquetaMeta))
+        {
+            Terminar(bonusMeta, "Meta");
+        }
     }
 
-    private void Terminar(float recompensa, string motivo)
+
+    // =========================================================
+    // TERMINAR EPISODIO
+    // =========================================================
+
+    private void Terminar(
+        float recompensa,
+        string motivo
+    )
     {
-        if (terminado) return;         
+        if (terminado)
+            return;
+
         terminado = true;
+
         AddReward(recompensa);
-        Debug.Log($"{motivo}: recompensa total del episodio = {GetCumulativeReward():F2}");
+
+        if (mostrarLogs)
+        {
+            Debug.Log(
+                $"{motivo}: recompensa total = {GetCumulativeReward():F3}"
+            );
+        }
+
         EndEpisode();
     }
 }
